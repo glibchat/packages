@@ -41,14 +41,60 @@ static void *rateContext = &rateContext;
 }
 
 - (instancetype)initWithPlayerItem:(AVPlayerItem *)item
-                         avFactory:(id<FVPAVFactory>)avFactory
-                         registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
+                        avFactory:(id<FVPAVFactory>)avFactory
+                        registrar:(NSObject<FlutterPluginRegistrar> *)registrar {
   self = [super init];
   NSAssert(self, @"super init cannot be nil");
 
   _registrar = registrar;
-
+  
+  // Configure audio session for compatibility with spatial audio content
+  NSError *audioSessionError = nil;
+  AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+  
+  // Set audio session to playback mode with mixable option
+  [audioSession setCategory:AVAudioSessionCategoryPlayback
+                      mode:AVAudioSessionModeDefault
+                   options:AVAudioSessionCategoryOptionMixWithOthers
+                     error:&audioSessionError];
+  
+  if (audioSessionError) {
+    NSLog(@"Error setting audio session category: %@", audioSessionError);
+    audioSessionError = nil;
+  }
+  
+  // Ensure stereo output is preferred (iOS 10+)
+  if (@available(iOS 10.0, *)) {
+    [audioSession setPreferredOutputNumberOfChannels:2 error:&audioSessionError];
+    if (audioSessionError) {
+      NSLog(@"Error setting preferred channel count: %@", audioSessionError);
+    }
+  }
+  
+  // Process the audio track to ensure compatibility
   AVAsset *asset = [item asset];
+  
+  // Create simple audio mix to control volume
+  AVMutableAudioMix *audioMix = [AVMutableAudioMix audioMix];
+  NSMutableArray *audioParams = [NSMutableArray array];
+  
+  for (AVAssetTrack *audioTrack in [asset tracksWithMediaType:AVMediaTypeAudio]) {
+    AVMutableAudioMixInputParameters *params = 
+        [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:audioTrack];
+    
+    // Ensure normal volume
+    [params setVolume:1.0f atTime:kCMTimeZero];
+    
+    [audioParams addObject:params];
+  }
+  
+  audioMix.inputParameters = audioParams;
+  item.audioMix = audioMix;
+  
+  _player = [avFactory playerWithPlayerItem:item];
+  _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+
+  // Continue with the rest of your initialization code
   void (^assetCompletionHandler)(void) = ^{
     if ([asset statusOfValueForKey:@"tracks" error:nil] == AVKeyValueStatusLoaded) {
       NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
@@ -57,7 +103,7 @@ static void *rateContext = &rateContext;
         void (^trackCompletionHandler)(void) = ^{
           if (self->_disposed) return;
           if ([videoTrack statusOfValueForKey:@"preferredTransform"
-                                        error:nil] == AVKeyValueStatusLoaded) {
+                                      error:nil] == AVKeyValueStatusLoaded) {
             // Rotate the video by using a videoComposition and the preferredTransform
             self->_preferredTransform = FVPGetStandardizedTransformForTrack(videoTrack);
             // Do not use video composition when it is not needed.
@@ -70,19 +116,16 @@ static void *rateContext = &rateContext;
             // use with media served using HTTP Live Streaming.
             AVMutableVideoComposition *videoComposition =
                 [self getVideoCompositionWithTransform:self->_preferredTransform
-                                             withAsset:asset
-                                        withVideoTrack:videoTrack];
+                                            withAsset:asset
+                                      withVideoTrack:videoTrack];
             item.videoComposition = videoComposition;
           }
         };
         [videoTrack loadValuesAsynchronouslyForKeys:@[ @"preferredTransform" ]
-                                  completionHandler:trackCompletionHandler];
+                                 completionHandler:trackCompletionHandler];
       }
     }
   };
-
-  _player = [avFactory playerWithPlayerItem:item];
-  _player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
 
   // Configure output.
   NSDictionary *pixBuffAttributes = @{
